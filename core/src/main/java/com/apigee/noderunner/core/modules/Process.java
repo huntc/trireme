@@ -74,6 +74,7 @@ public class Process
         private Scriptable stdin;
         private Scriptable argv;
         private Scriptable env;
+        private Object domain;
         private long startTime;
         private ScriptRunner runner;
         private Object mainModule;
@@ -331,7 +332,6 @@ public class Process
         }
 
         // TODO kill
-        // TODO pid
 
         @JSGetter("title")
         public String getTitle()
@@ -396,12 +396,40 @@ public class Process
         {
             Function f = functionArg(args, 0, true);
             ProcessImpl proc = (ProcessImpl)thisObj;
-            proc.runner.enqueueCallbackWithLimit(f, f, thisObj, new Object[0]);
+
+            proc.nextTickInternal(f, null);
+        }
+
+        @JSFunction
+        public static void _nextDomainTick(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            ProcessImpl self = (ProcessImpl)thisObj;
+            Function f = functionArg(args, 0, true);
+
+            Scriptable domain = null;
+            if ((self.domain != null) && !Context.getUndefinedValue().equals(self.domain)) {
+                domain = (Scriptable)self.domain;
+            }
+
+            self.nextTickInternal(f, domain);
+        }
+
+        private void nextTickInternal(Function f, Scriptable domain)
+        {
+            runner.enqueueCallbackWithLimit(f, f, this, domain, new Object[0]);
         }
 
         @JSFunction
         public static void _tickCallback(Context cx, Scriptable thisObj, Object[] args, Function func)
         {
+            ProcessImpl proc = (ProcessImpl)thisObj;
+            proc.runner.executeTicks(cx);
+        }
+
+        @JSFunction
+        public static void _tickDomainCallback(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            // In our implementation there is just one queue -- do we need to revisit that?
             ProcessImpl proc = (ProcessImpl)thisObj;
             proc.runner.executeTicks(cx);
         }
@@ -420,6 +448,18 @@ public class Process
             } else {
                 runner.setMaxTickDepth((int)depth);
             }
+        }
+
+        @JSGetter("domain")
+        public Object getDomain()
+        {
+            return domain;
+        }
+
+        @JSSetter("domain")
+        public void setDomain(Object domain)
+        {
+            this.domain = domain;
         }
 
         @JSSetter("_needImmediateCallback")

@@ -105,4 +105,12 @@
                      use a different keystore format.
         </Description>
     </Excluded>
+    <Excluded>
+        <Name>test-dgram-.+\.js</Name>
+        <Description>No datagram support yet</Description>
+    </Excluded>
+    <Excluded>
+        <Name>test-debug-.+\.js</Name>
+        <Description>Node debugger will not be supported</Description>
+    </Excluded>
 </ExcludedTests>

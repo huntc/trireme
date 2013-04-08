@@ -65,6 +65,7 @@ Domain.prototype.enter = function() {
   // to push it onto the stack so that we can pop it later.
   exports.active = process.domain = this;
   stack.push(this);
+  console.log('Enter domain ' + stack.length);
 };
 
 Domain.prototype.exit = function() {
@@ -78,6 +79,7 @@ Domain.prototype.exit = function() {
 
   exports.active = stack[stack.length - 1];
   process.domain = exports.active;
+  console.log('Exited domain ' + stack.length);
 };
 
 // note: this works for timers as well.

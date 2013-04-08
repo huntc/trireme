@@ -16,6 +16,7 @@ import org.mozilla.javascript.Context;
 import org.mozilla.javascript.ContextAction;
 import org.mozilla.javascript.EvaluatorException;
 import org.mozilla.javascript.Function;
+import org.mozilla.javascript.JavaScriptException;
 import org.mozilla.javascript.RhinoException;
 import org.mozilla.javascript.Scriptable;
 import org.mozilla.javascript.ScriptableObject;
@@ -34,7 +35,6 @@ import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.PriorityQueue;
-import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Future;
@@ -44,7 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * This class actually runs the script.
  */
 public class ScriptRunner
-    implements NodeRuntime, Callable<ScriptStatus>
+    implements NodeRuntime, java.util.concurrent.Callable<ScriptStatus>
 {
     public static final String RUNNER = "runner";
 
@@ -258,7 +258,7 @@ public class ScriptRunner
     @Override
     public void enqueueCallback(Function f, Scriptable scope, Scriptable thisObj, Object[] args)
     {
-        tickFunctions.offer(new Callback(f, scope, thisObj, args));
+        tickFunctions.offer(new Callback(f, scope, thisObj, null, args));
         selector.wakeup();
     }
 
@@ -276,9 +276,10 @@ public class ScriptRunner
      * This method is used specifically by process.nextTick, and stuff submitted here is subject to
      * process.maxTickCount.
      */
-    public void enqueueCallbackWithLimit(Function f, Scriptable scope, Scriptable thisObj, Object[] args)
+    public void enqueueCallbackWithLimit(Function f, Scriptable scope, Scriptable thisObj,
+                                         Scriptable domain, Object[] args)
     {
-        Callback cb = new Callback(f, scope, thisObj, args);
+        Callback cb = new Callback(f, scope, thisObj, domain, args);
         cb.setHasLimit(true);
         tickFunctions.offer(cb);
         selector.wakeup();
@@ -289,9 +290,10 @@ public class ScriptRunner
      * outside the context of the "TimerWrap" module then we need to check for synchronization, add an
      * assertion check, or synchronize the timer queue.
      */
-    public Activity createTimer(long delay, boolean repeating, long repeatInterval, ScriptTask task, Scriptable scope)
+    public Activity createTimer(long delay, boolean repeating, long repeatInterval,
+                                ScriptTask task, Scriptable scope, Scriptable domain)
     {
-        Task t = new Task(task, scope);
+        Task t = new Task(task, scope, domain);
         long timeout = System.currentTimeMillis() + delay;
         int seq = timerSequence++;
 
@@ -839,7 +841,7 @@ public class ScriptRunner
         cx.removeThreadLocal(TIMEOUT_TIMESTAMP_KEY);
     }
 
-    public abstract static class Activity
+    public abstract class Activity
         implements Comparable<Activity>
     {
         protected int id;
@@ -848,8 +850,68 @@ public class ScriptRunner
         protected boolean repeating;
         protected boolean cancelled;
         protected boolean hasLimit;
+        protected Scriptable domain;
 
-        abstract void execute(Context cx);
+        protected abstract void executeInternal(Context cx);
+
+        void execute(Context cx)
+        {
+            if (domain != null) {
+                if (domain.has("_disposed", domain)) {
+                    return;
+                }
+                Object enter = ScriptableObject.getProperty(domain, "enter");
+                if ((enter != null) && !Context.getUndefinedValue().equals(enter)) {
+                    ((Function)enter).call(cx, ((Function)enter), domain, null);
+                }
+            }
+
+            try {
+                try {
+                    executeInternal(cx);
+                } finally {
+                    if (domain != null) {
+                        Object exit = ScriptableObject.getProperty(domain, "exit");
+                        if ((exit != null) && !Context.getUndefinedValue().equals(exit)) {
+                            ((Function)exit).call(cx, ((Function)exit), domain, null);
+                        }
+                    }
+                }
+
+            } catch (JavaScriptException jse) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Caught error in tick: {}", jse);
+                }
+                boolean handled = false;
+                Object pDom = process.getDomain();
+                Scriptable procDomain = null;
+                if ((pDom != null) && !Context.getUndefinedValue().equals(pDom)) {
+                    procDomain = (Scriptable)pDom;
+                }
+                if (procDomain != null) {
+                    Scriptable error;
+                    if ((jse.getValue() != null) && (jse.getValue() instanceof Scriptable)) {
+                        error = (Scriptable)jse.getValue();
+                    } else {
+                        error = Utils.makeErrorObject(cx, procDomain, jse.getMessage());
+                    }
+                    Object emit = ScriptableObject.getProperty(procDomain, "emit");
+                    if ((emit != null) && !Context.getUndefinedValue().equals(emit)) {
+                        error.put("domain", error, procDomain);
+                        Object ret = ((Function)emit).call(cx, (Function)emit, procDomain, new Object[] { "error", error });
+                        if (Context.toBoolean(ret)) {
+                            if (log.isDebugEnabled()) {
+                                log.debug("Handled by domain");
+                            }
+                            handled = true;
+                        }
+                    }
+                }
+                if (!handled) {
+                    throw jse;
+                }
+            }
+        }
 
         int getId() {
             return id;
@@ -912,7 +974,7 @@ public class ScriptRunner
         }
     }
 
-    private static final class Callback
+    private final class Callback
         extends Activity
     {
         Function function;
@@ -920,22 +982,23 @@ public class ScriptRunner
         Scriptable thisObj;
         Object[] args;
 
-        Callback(Function f, Scriptable s, Scriptable thisObj, Object[] args)
+        Callback(Function f, Scriptable s, Scriptable thisObj, Scriptable domain, Object[] args)
         {
             this.function = f;
             this.scope = s;
             this.thisObj = thisObj;
+            this.domain = domain;
             this.args = args;
         }
 
         @Override
-        void execute(Context cx)
+        protected void executeInternal(Context cx)
         {
             function.call(cx, scope, thisObj, args);
         }
     }
 
-    private static final class Task
+    private final class Task
         extends Activity
     {
         private ScriptTask task;
@@ -947,8 +1010,15 @@ public class ScriptRunner
             this.scope = scope;
         }
 
+        Task(ScriptTask task, Scriptable scope, Scriptable domain)
+        {
+            this.task = task;
+            this.scope = scope;
+            this.domain = domain;
+        }
+
         @Override
-        void execute(Context ctx)
+        protected void executeInternal(Context ctx)
         {
             task.execute(ctx, scope);
         }
