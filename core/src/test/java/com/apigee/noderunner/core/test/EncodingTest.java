@@ -4,6 +4,7 @@ import com.apigee.noderunner.core.internal.Utils;
 import org.junit.Test;
 import org.omg.CORBA.PUBLIC_MEMBER;
 
+import java.io.IOException;
 import java.io.UnsupportedEncodingException;
 import java.nio.ByteBuffer;
 import java.nio.charset.Charset;
@@ -244,5 +245,46 @@ public class EncodingTest
         byte[] ascii = text.getBytes("ascii");
         String encoded = new String(ascii, encoding);
         System.out.println(encoded);
+    }
+
+    @Test
+    public void testPemToDer()
+        throws IOException
+    {
+        String pem = Utils.readStream(EncodingTest.class.getResourceAsStream("/agent.pem"));
+        byte[] expectedDer = Utils.readBinaryStream(EncodingTest.class.getResourceAsStream("/agent.der"));
+        ByteBuffer enc = Utils.pemToDer(pem);
+        assertEquals(expectedDer.length, enc.limit());
+        assertArrayEquals(expectedDer, enc.array());
+    }
+
+    @Test
+    public void testDerToPem()
+        throws IOException
+    {
+        String expectedPem = Utils.readStream(EncodingTest.class.getResourceAsStream("/agent.pem"));
+        byte[] der = Utils.readBinaryStream(EncodingTest.class.getResourceAsStream("/agent.der"));
+        String pem = Utils.derToPem(ByteBuffer.wrap(der), "RSA PRIVATE KEY");
+        assertEquals(expectedPem, pem);
+    }
+
+    @Test
+    public void testPemToDerToPem()
+        throws IOException
+    {
+        String expectedPem = Utils.readStream(EncodingTest.class.getResourceAsStream("/agent.pem"));
+        ByteBuffer der = Utils.pemToDer(expectedPem);
+        String pem = Utils.derToPem(der, "RSA PRIVATE KEY");
+        assertEquals(expectedPem, pem);
+    }
+
+    @Test
+    public void testDerToPemToDer()
+        throws IOException
+    {
+        byte[] expectedDer = Utils.readBinaryStream(EncodingTest.class.getResourceAsStream("/agent.der"));
+        String pem = Utils.derToPem(ByteBuffer.wrap(expectedDer), "RSA PRIVATE KEY");
+        ByteBuffer der = Utils.pemToDer(pem);
+        assertArrayEquals(expectedDer, der.array());
     }
 }

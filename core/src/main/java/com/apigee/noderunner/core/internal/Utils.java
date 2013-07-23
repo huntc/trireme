@@ -6,12 +6,15 @@ import org.mozilla.javascript.JavaScriptException;
 import org.mozilla.javascript.RhinoException;
 import org.mozilla.javascript.Scriptable;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
+import java.io.StringReader;
 import java.lang.reflect.Method;
 import java.nio.ByteBuffer;
 import java.nio.CharBuffer;
@@ -44,6 +47,21 @@ public class Utils
             }
         } while (r > 0);
         return str.toString();
+    }
+
+    public static byte[] readBinaryStream(InputStream in)
+        throws IOException
+    {
+        ByteArrayOutputStream bos = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int r;
+        do {
+            r = in.read(buf);
+            if (r > 0) {
+                bos.write(buf, 0, r);
+            }
+        } while (r > 0);
+        return bos.toByteArray();
     }
 
     public static String readFile(File f)
@@ -124,7 +142,7 @@ public class Utils
         return cBuf.toString();
     }
 
-    public static ByteBuffer stringToBuffer(String str, Charset cs)
+    public static ByteBuffer stringToBuffer(CharSequence str, Charset cs)
     {
         CharsetEncoder enc = cs.newEncoder();
         CharBuffer chars = CharBuffer.wrap(str);
@@ -230,5 +248,61 @@ public class Utils
             ret.add(Context.toString(val));
         }
         return ret;
+    }
+
+    private static final int BASE64_LINELEN = 64;
+
+    /**
+     * Convert binary data to "PEM" by adding BEGIN WHATEVER and END WHATEVER wrappers and then
+     * base64-encoding the rest.
+     *
+     * @param typeMarker what to put after BEGIN and END like "CERTIFICATE" or whatever
+     */
+    public static String derToPem(ByteBuffer der, String typeMarker)
+    {
+        StringBuilder pem = new StringBuilder();
+        pem.append("-----BEGIN " + typeMarker + "-----\n");
+        String base64 = bufferToString(der, Charsets.BASE64);
+
+        int pos = 0;
+        do {
+            int len = Math.min((base64.length() - pos), BASE64_LINELEN);
+            pem.append(base64.substring(pos, pos + len));
+            pem.append('\n');
+            pos += len;
+        } while (pos < base64.length());
+
+        pem.append("-----END " + typeMarker + "-----\n");
+        return pem.toString();
+    }
+
+    /**
+     * Convert "PEM" data to binary by stripping off the BEGIN and END lines and
+     * then base64-decoding the rest.
+     */
+    public static ByteBuffer pemToDer(String pem)
+    {
+        BufferedReader rdr = new BufferedReader(new StringReader(pem));
+        StringBuilder base64 = new StringBuilder();
+
+        try {
+            String line = rdr.readLine();
+            while ((line != null) && !line.startsWith("-----BEGIN")) {
+                line = rdr.readLine();
+            }
+            // We read BEGIN -- now read on
+            if (line != null) {
+                line = rdr.readLine();
+            }
+
+            while ((line != null) && !line.startsWith("-----END")) {
+                base64.append(line);
+                line = rdr.readLine();
+            }
+        } catch (IOException ioe) {
+            throw new AssertionError(ioe);
+        }
+
+        return stringToBuffer(base64, Charsets.BASE64);
     }
 }

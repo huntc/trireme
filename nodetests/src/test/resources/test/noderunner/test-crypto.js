@@ -42,7 +42,15 @@ var rsaKeyPem = fs.readFileSync(common.fixturesDir + '/test_rsa_privkey.pem',
     'ascii');
 
 /*
- * Noderunner: Not supported yet
+ * Noderunner: Not supported yet.
+ */
+assert.throws(function() {
+  crypto.createCredentials({key: keyPem,
+                            cert: certPem,
+                            ca: caPem});
+}, 'not supported');
+
+/*
 try {
   var credentials = crypto.createCredentials(
                                              {key: keyPem,
@@ -497,6 +505,15 @@ assert.throws(function() {
 });
 
 /*
+ * No signing support in Noderunner yet.
+ */
+assert.throws(function() {
+  crypto.createSign('RSA-SHA1')
+               .update('Test123')
+               .sign(keyPem, 'base64');
+}, 'not supported');
+
+/*
 // Test signing and verifying
 var s1 = crypto.createSign('RSA-SHA1')
                .update('Test123')
@@ -548,10 +565,9 @@ verStream.write('t12');
 verStream.end('3');
 verified = verStream.verify(certPem, s3);
 assert.strictEqual(verified, true, 'sign and verify (stream)');
+
 */
 
-/*
- * Noderunner: Not yet
 function testCipher1(key) {
   // Test encryption and decryption
   var plaintext = 'Keep this a secret? No! Tell everyone about node.js!';
@@ -676,6 +692,10 @@ assert.throws(function() {
   crypto.createHash('sha1').update({foo: 'bar'});
 }, /buffer/);
 
+
+
+/* 
+ * Noderunner: Not yet
 
 // Test Diffie-Hellman with two parties sharing a secret,
 // using various encodings as we go along

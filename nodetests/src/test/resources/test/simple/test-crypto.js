@@ -31,6 +31,7 @@ try {
   console.log('Not compiled with OPENSSL support.');
   process.exit();
 }
+console.log('crypto module loaded');
 
 crypto.DEFAULT_ENCODING = 'buffer';
 
@@ -53,6 +54,7 @@ try {
                                                cert: certPem,
                                                ca: caPem});
 } catch (e) {
+  console.error('createCredentials failed: %s', e);
   console.log('Not compiled with OPENSSL support.');
   process.exit();
 }

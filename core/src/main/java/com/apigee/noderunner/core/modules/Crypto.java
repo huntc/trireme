@@ -1,5 +1,7 @@
 package com.apigee.noderunner.core.modules;
 
+import com.apigee.noderunner.core.internal.Charsets;
+import com.apigee.noderunner.core.internal.CryptoAlgorithms;
 import com.apigee.noderunner.core.internal.InternalNodeModule;
 import com.apigee.noderunner.core.internal.Utils;
 import com.apigee.noderunner.core.NodeRuntime;
@@ -13,16 +15,35 @@ import org.mozilla.javascript.Undefined;
 import org.mozilla.javascript.annotations.JSConstructor;
 import org.mozilla.javascript.annotations.JSFunction;
 
+import javax.crypto.Cipher;
 import javax.crypto.Mac;
+import javax.crypto.SecretKey;
+import javax.crypto.SecretKeyFactory;
+import javax.crypto.spec.PBEKeySpec;
 import javax.crypto.spec.SecretKeySpec;
+import java.io.ByteArrayOutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.nio.ByteBuffer;
+import java.nio.charset.Charset;
+import java.security.GeneralSecurityException;
 import java.security.InvalidKeyException;
+import java.security.Key;
+import java.security.KeyFactory;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.PrivateKey;
 import java.security.SecureRandom;
+import java.security.Signature;
+import java.security.SignatureException;
+import java.security.spec.InvalidKeySpecException;
+import java.security.spec.KeySpec;
+import java.security.spec.PKCS8EncodedKeySpec;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Random;
 import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.apigee.noderunner.core.internal.ArgUtils.*;
 
@@ -74,6 +95,10 @@ public class Crypto
 
         ScriptableObject.defineClass(export, HashImpl.class, false, true);
         ScriptableObject.defineClass(export, MacImpl.class, false, true);
+        ScriptableObject.defineClass(export, SecureContextImpl.class, false, false);
+        ScriptableObject.defineClass(export, SignImpl.class, false, false);
+        ScriptableObject.defineClass(export, CipherImpl.class, false, false);
+        ScriptableObject.defineClass(export, DecipherImpl.class, false, false);
 
         return export;
     }
@@ -224,17 +249,31 @@ public class Crypto
         public static void update(Context cx, Scriptable thisObj, Object[] args, Function func)
         {
             HashImpl thisClass = (HashImpl) thisObj;
-            Buffer.BufferImpl buf = objArg(args, 0, Buffer.BufferImpl.class, true);
+            ensureArg(args, 0);
+            String encoding = stringArg(args, 1, null);
 
-            thisClass.messageDigest.update(buf.getArray(), buf.getArrayOffset(), buf.getLength());
+            if (args[0] instanceof String) {
+                ByteBuffer bb = Utils.stringToBuffer(stringArg(args, 0),
+                                                     Charsets.get().resolveCharset(encoding));
+                thisClass.messageDigest.update(bb.array(), bb.arrayOffset(), bb.limit());
+            } else {
+                Buffer.BufferImpl buf = objArg(args, 0, Buffer.BufferImpl.class, true);
+                thisClass.messageDigest.update(buf.getArray(), buf.getArrayOffset(), buf.getLength());
+            }
         }
 
         @JSFunction
         public static Object digest(Context cx, Scriptable thisObj, Object[] args, Function func)
         {
             HashImpl thisClass = (HashImpl) thisObj;
+            String encoding = stringArg(args, 0, null);
+
             byte[] digest = thisClass.messageDigest.digest();
-            return Buffer.BufferImpl.newBuffer(cx, thisObj, digest);
+            if ((encoding == null) || "buffer".equals(encoding)) {
+                return Buffer.BufferImpl.newBuffer(cx, thisObj, digest);
+            }
+            ByteBuffer bb = ByteBuffer.wrap(digest);
+            return Utils.bufferToString(bb, Charsets.get().resolveCharset(encoding));
         }
 
     }
@@ -294,17 +333,310 @@ public class Crypto
         public static void update(Context cx, Scriptable thisObj, Object[] args, Function func)
         {
             MacImpl thisClass = (MacImpl) thisObj;
-            Buffer.BufferImpl buf = objArg(args, 0, Buffer.BufferImpl.class, true);
+            ensureArg(args, 0);
+            String encoding = stringArg(args, 1, null);
 
-            thisClass.digest.update(buf.getArray(), buf.getArrayOffset(), buf.getLength());
+            if (args[0] instanceof String) {
+                ByteBuffer bb = Utils.stringToBuffer(stringArg(args, 0),
+                                                     Charsets.get().resolveCharset(encoding));
+                thisClass.digest.update(bb.array(), bb.arrayOffset(), bb.limit());
+            } else {
+                Buffer.BufferImpl buf = objArg(args, 0, Buffer.BufferImpl.class, true);
+                thisClass.digest.update(buf.getArray(), buf.getArrayOffset(), buf.getLength());
+            }
         }
 
         @JSFunction
         public static Object digest(Context cx, Scriptable thisObj, Object[] args, Function func)
         {
             MacImpl thisClass = (MacImpl) thisObj;
+            String encoding = stringArg(args, 0, null);
+
             byte[] digest = thisClass.digest.doFinal();
-            return Buffer.BufferImpl.newBuffer(cx, thisObj, digest);
+            if ((encoding == null) || "buffer".equals(encoding)) {
+                return Buffer.BufferImpl.newBuffer(cx, thisObj, digest);
+            }
+            ByteBuffer bb = ByteBuffer.wrap(digest);
+            return Utils.bufferToString(bb, Charsets.get().resolveCharset(encoding));
+        }
+    }
+
+    public abstract static class AbstractCipherImpl
+        extends ScriptableObject
+    {
+        private static final byte[] EMPTY_BUF = new byte[0];
+
+        private Cipher cipher;
+        private byte[] pwBuf;
+        private String cipherName;
+        private boolean padding = true;
+        private boolean initialized;
+
+        protected abstract int getMode();
+
+        protected static void setAutoPaddingInternal(Context cx, Scriptable thisObj, Object[] args)
+        {
+            AbstractCipherImpl self = (AbstractCipherImpl)thisObj;
+
+            if (self.initialized) {
+                throw Utils.makeError(cx, thisObj, "Cannot call setAutoPadding after update or final");
+            }
+            self.padding = booleanArg(args, 0, true);
+        }
+
+        protected static void initInternal(Context cx, Scriptable thisObj, Object[] args)
+        {
+            AbstractCipherImpl self = (AbstractCipherImpl)thisObj;
+            self.cipherName = stringArg(args, 0);
+            Buffer.BufferImpl pw = objArg(args, 1, Buffer.BufferImpl.class, true);
+
+            // Copy the password so that the buffer can get GCed and we can clear it when done
+            self.pwBuf = new byte[pw.getLength()];
+            System.arraycopy(pw.getArray(), pw.getArrayOffset(), self.pwBuf, 0, pw.getLength());
+        }
+
+
+        private void initialize(Context cx)
+        {
+            /*
+             * Aargh. To do this, we will need to somehow:
+             *
+             * . Figure out if the algorithm requires an IV, and if so, which size
+             * . If so, then generate the random IV during encryption
+             * . On the first "update," or "final" if not, return the IV as a prefix to the ciphertext
+             * . Then on decryption, on the first "update" or "final," read the IV bytes first
+             * . Don't forget that you might not get all, say, 16 bytes on the first call, so save state
+             * . Then use the IV to initialize decryption
+             * . Then decrypt
+             * . and remember that we might only need this rigamarole for AES
+             */
+            CryptoAlgorithms.Spec algSpec = CryptoAlgorithms.get().getAlgorithm(cipherName, padding);
+            if (algSpec == null) {
+                throw Utils.makeError(cx, this, "Unsupported cipher algorithm " + cipher);
+            }
+
+            try {
+                cipher = Cipher.getInstance(algSpec.getName());
+            } catch (GeneralSecurityException gse) {
+                throw Utils.makeError(cx, this, "Cipher algorithm " + cipherName + " (" +
+                                      algSpec.getName() + ") unsupported on the JVM");
+            }
+
+            Key key;
+
+            try {
+                if (algSpec.getKeyLen() > 0) {
+                    // Some crypto algorithms require that the key be set to a specific length. So we need to hash the
+                    // password and use it to generate a key of the exact length required.
+                    // Regular node does this using an OpenSSL method that uses MD5 with no salt,
+                    // so that's what we use.
+                    byte[] digest;
+                    try {
+                        MessageDigest digester = MessageDigest.getInstance("MD5");
+                        digester.update(pwBuf);
+                        digest = digester.digest();
+                    } catch (GeneralSecurityException gse) {
+                        throw Utils.makeError(cx, this, "Error digesting cipher key: " + gse);
+                    }
+
+                    int desiredLen = Math.min(digest.length, algSpec.getKeyLen() / 8);
+                    key = new SecretKeySpec(digest, 0, desiredLen, algSpec.getAlgo());
+
+                } else {
+                    key = new SecretKeySpec(pwBuf, algSpec.getAlgo());
+                }
+            } finally {
+                Arrays.fill(pwBuf, (byte)0);
+            }
+
+            try {
+                cipher.init(getMode(), key);
+            } catch (GeneralSecurityException gse) {
+                throw Utils.makeError(cx, this, "Error initializing cipher: " + gse);
+            }
+
+            initialized = true;
+        }
+
+        protected static Object updateInternal(Context cx, Scriptable thisObj, Object[] args)
+        {
+            ensureArg(args, 0);
+            String encoding = stringArg(args, 1, null);
+            AbstractCipherImpl self = (AbstractCipherImpl)thisObj;
+
+            if (!self.initialized) {
+                self.initialize(cx);
+            }
+
+            byte[] result;
+            if (args[0] instanceof String) {
+                ByteBuffer bb = Utils.stringToBuffer(stringArg(args, 0),
+                                                     Charsets.get().resolveCharset(encoding));
+                result = self.cipher.update(bb.array(), bb.arrayOffset(), bb.limit());
+            } else {
+                Buffer.BufferImpl buf = objArg(args, 0, Buffer.BufferImpl.class, true);
+                result = self.cipher.update(buf.getArray(), buf.getArrayOffset(), buf.getLength());
+            }
+
+            if (result == null) {
+                result = EMPTY_BUF;
+            }
+            return Buffer.BufferImpl.newBuffer(cx, thisObj, result);
+        }
+
+        protected static Object finalInternal(Context cx, Scriptable thisObj, Object[] args)
+        {
+            AbstractCipherImpl self = (AbstractCipherImpl)thisObj;
+
+            if (!self.initialized) {
+                self.initialize(cx);
+            }
+
+            byte[] result;
+            try {
+                result = self.cipher.doFinal();
+            } catch (GeneralSecurityException gse) {
+                throw Utils.makeError(cx, thisObj, "Cryptography error: " + gse);
+            }
+
+            if (result == null) {
+                result = EMPTY_BUF;
+            }
+            return Buffer.BufferImpl.newBuffer(cx, thisObj, result);
+        }
+    }
+
+    public static class CipherImpl
+        extends AbstractCipherImpl
+    {
+        public static final String CLASS_NAME = "Cipher";
+
+        @Override
+        public String getClassName()
+        {
+            return CLASS_NAME;
+        }
+
+        @Override
+        protected int getMode()
+        {
+            return Cipher.ENCRYPT_MODE;
+        }
+
+        @JSFunction
+        public static void init(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            initInternal(cx, thisObj, args);
+        }
+
+        @JSFunction
+        public static void setAutoPadding(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            setAutoPaddingInternal(cx, thisObj, args);
+        }
+
+        @JSFunction("final")
+        public static Object doFinal(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            return finalInternal(cx, thisObj, args);
+        }
+
+        @JSFunction
+        public static Object update(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            return updateInternal(cx, thisObj, args);
+        }
+    }
+
+    public static class DecipherImpl
+        extends AbstractCipherImpl
+    {
+        public static final String CLASS_NAME = "Decipher";
+
+        @Override
+        public String getClassName()
+        {
+            return CLASS_NAME;
+        }
+
+        @Override
+        protected int getMode()
+        {
+            return Cipher.DECRYPT_MODE;
+        }
+
+        @JSFunction
+        public static void init(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            initInternal(cx, thisObj, args);
+        }
+
+        @JSFunction
+        public static void setAutoPadding(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            setAutoPaddingInternal(cx, thisObj, args);
+        }
+
+        @JSFunction("final")
+        public static Object doFinal(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            return finalInternal(cx, thisObj, args);
+        }
+
+        @JSFunction
+        public static Object update(Context cx, Scriptable thisObj, Object[] args, Function func)
+        {
+            return updateInternal(cx, thisObj, args);
+        }
+    }
+
+    public static class SignImpl
+        extends ScriptableObject
+    {
+        public static final String CLASS_NAME = "Sign";
+
+        /*
+         * Aargh. To make this work, we will need to:
+         *
+         * . Convert PEM-encoded keys to DER (code already in Utils)
+         * . Extract RSA private key info from the DER, by parsing the ASN.1
+         * . Generate the RSA private key
+         * . We may be better off plugging in Bouncy Castle as an optional dependency
+         */
+
+        @Override
+        public String getClassName()
+        {
+            return CLASS_NAME;
+        }
+
+        @JSConstructor
+        public static void init(Context cx, Object[] args, Function ctorObj, boolean inNewExpr)
+        {
+            throw Utils.makeError(cx, ctorObj, "crypto signatures are not supported in Noderunner");
+        }
+    }
+
+    public static class SecureContextImpl
+        extends ScriptableObject
+    {
+        public static final String CLASS_NAME = "SecureContext";
+
+        /*
+         * This appears to be used solely by TLS, and we do that differently in our implementation,
+         * so leave it out.
+         */
+
+        @Override
+        public String getClassName()
+        {
+            return CLASS_NAME;
+        }
+
+        @JSConstructor
+        public static void init(Context cx, Object[] args, Function ctorObj, boolean inNewExpr)
+        {
+            throw Utils.makeError(cx, ctorObj, "crypto credentials not supported in Noderunner");
         }
     }
 }
