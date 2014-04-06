@@ -254,9 +254,9 @@
    </profiles>
 
   <scm>
-    <url>git@github.com:apigee/trireme.git</url>
-    <connection>scm:git:https://github.com/apigee/trireme.git</connection>
-    <developerConnection>scm:git:ssh://git@github.com/apigee/trireme.git</developerConnection>
+    <url>git@github.com:huntc/trireme.git</url>
+    <connection>scm:git:https://github.com/huntc/trireme.git</connection>
+    <developerConnection>scm:git:ssh://git@github.com/huntc/trireme.git</developerConnection>
   </scm>
 
   <developers>
